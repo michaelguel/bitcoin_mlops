@@ -16,4 +16,3 @@ EXPOSE 8501
 
 # Run Streamlit app
 CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--browser.serverAddress=localhost"]
-

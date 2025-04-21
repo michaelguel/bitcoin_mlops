@@ -1,16 +1,13 @@
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
 import time
+from datetime import datetime, timedelta
+
+import pandas as pd
+import requests
+
 
 def fetch_histohour_chunk(to_timestamp, limit=2000):
     url = "https://min-api.cryptocompare.com/data/v2/histohour"
-    params = {
-        "fsym": "BTC",
-        "tsym": "USD",
-        "limit": limit - 1,      
-        "toTs": to_timestamp     
-    }
+    params = {"fsym": "BTC", "tsym": "USD", "limit": limit - 1, "toTs": to_timestamp}
 
     response = requests.get(url, params=params)
     if response.status_code == 200:
@@ -23,6 +20,7 @@ def fetch_histohour_chunk(to_timestamp, limit=2000):
     else:
         print("Failed:", response.status_code)
         return pd.DataFrame()
+
 
 # Pull in reverse chunks from now back to 1 year ago
 end_time = datetime.utcnow()
@@ -48,16 +46,13 @@ while True:
         break
 
     current_end = earliest_time
-    time.sleep(1) 
+    time.sleep(1)
 
 # Combine and process
 df = pd.concat(all_chunks, ignore_index=True)
 df["timestamp"] = pd.to_datetime(df["time"], unit="s")
 df = df[["timestamp", "open", "high", "low", "close", "volumefrom", "volumeto"]]
-df.rename(columns={
-    "volumefrom": "volume_btc",
-    "volumeto": "volume_usd"
-}, inplace=True)
+df.rename(columns={"volumefrom": "volume_btc", "volumeto": "volume_usd"}, inplace=True)
 df.drop_duplicates(subset="timestamp", inplace=True)
 df.sort_values("timestamp", inplace=True)
 df.reset_index(drop=True, inplace=True)
