@@ -1,15 +1,33 @@
-from datetime import datetime
+import os
 
-import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+import seaborn as sns
 import streamlit as st
+from scipy.stats import ks_2samp
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from xgboost import XGBClassifier
 
-# Load model
-model = joblib.load("docker/btc_xgb_classifier.pkl")
+# ─── 1. Model Loading ───────────────────────────────────────────────────────────
+HERE = os.path.dirname(__file__)
+ROOT = os.path.abspath(os.path.join(HERE, os.pardir))
+MODEL_PATH = os.path.join(ROOT, "model", "btc_xgb_classifier.json")
 
-# Define feature order (must match training)
+# Load pre-trained XGBoost classifier
+model = XGBClassifier()
+model.load_model(MODEL_PATH)
+
+
+# ─── 2. Feature Definitions ─────────────────────────────────────────────────────
 FEATURES = [
     "open",
     "high",
@@ -27,151 +45,350 @@ FEATURES = [
 ]
 
 
-# Function to fetch most recent hour
-# @st.cache_data(show_spinner=False)
-def fetch_latest_hour():
+# ─── 3. PSI Helper ──────────────────────────────────────────────────────────────
+def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
+    """
+    Compute Population Stability Index (PSI) between two arrays.
+    PSI > 0.25 indicates major drift; 0.1-0.25 moderate; <0.1 negligible.
+    """
+    # Determine common bin edges from the expected (baseline) distribution
+    bin_edges = np.histogram_bin_edges(expected, bins=bins)
+    exp_freq = np.histogram(expected, bins=bin_edges)[0] / len(expected)
+    act_freq = np.histogram(actual, bins=bin_edges)[0] / len(actual)
+    # Replace zeros to avoid log(0)
+    exp_freq = np.where(exp_freq == 0, 1e-6, exp_freq)
+    act_freq = np.where(act_freq == 0, 1e-6, act_freq)
+    # Sum over bins
+    return float(np.sum((exp_freq - act_freq) * np.log(exp_freq / act_freq)))
+
+
+# ─── 4. Data Fetching ───────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def fetch_latest_hour(limit: int = 500) -> pd.DataFrame:
+    """
+    Fetch the last `limit` hours of BTC OHLCV data from CryptoCompare.
+    """
     url = "https://min-api.cryptocompare.com/data/v2/histohour"
-    params = {
-        "fsym": "BTC",
-        "tsym": "USD",
-        "limit": 190,  # increased to ensure rolling features are valid
-    }
-    response = requests.get(url, params=params)
-    data = response.json()["Data"]["Data"]
-    df = pd.DataFrame(data)
+    params = {"fsym": "BTC", "tsym": "USD", "limit": limit}
+    raw_data = requests.get(url, params=params).json()["Data"]["Data"]
+    df = pd.DataFrame(raw_data)
     df["timestamp"] = pd.to_datetime(df["time"], unit="s")
+    # Rename columns to match FEATURES
     df.rename(
         columns={"volumefrom": "volume_btc", "volumeto": "volume_usd"}, inplace=True
     )
     return df
 
 
-def fetch_current_btc_price():
+@st.cache_data
+def fetch_current_btc_price() -> dict:
+    """
+    Fetch the current BTC price, 24h change, and 24h volume from CryptoCompare.
+    """
     url = "https://min-api.cryptocompare.com/data/pricemultifull"
     params = {"fsyms": "BTC", "tsyms": "USD"}
-    r = requests.get(url, params=params)
-    data = r.json()["RAW"]["BTC"]["USD"]
+    raw = requests.get(url, params=params).json()["RAW"]["BTC"]["USD"]
     return {
-        "price": data["PRICE"],
-        "change_24h": data["CHANGE24HOUR"],
-        "volume_24h": data["TOTALVOLUME24H"],
+        "price": raw["PRICE"],
+        "change_24h": raw["CHANGE24HOUR"],
+        "volume_24h": raw["TOTALVOLUME24H"],
     }
 
 
-# Preprocessing for model input
-def prepare_features(df):
+# ─── 5. Feature Engineering ─────────────────────────────────────────────────────
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given raw OHLCV, compute rolling features and the binary direction label.
+    """
+    df = df.copy()
+    # Momentum = close minus open
     df["momentum"] = df["close"] - df["open"]
-    df["volatility_24h"] = df["close"].rolling(window=24).std()
-    df["sma_24"] = df["close"].rolling(window=24).mean()
-    df["sma_168"] = df["close"].rolling(window=168).mean()
+    # 24h volatility (std), simple moving averages
+    df["volatility_24h"] = df["close"].rolling(24).std()
+    df["sma_24"] = df["close"].rolling(24).mean()
+    df["sma_168"] = df["close"].rolling(168).mean()
+    # Returns over various horizons
     df["return_1h"] = df["close"].pct_change(1)
     df["return_3h"] = df["close"].pct_change(3)
     df["return_6h"] = df["close"].pct_change(6)
 
-    # Drop NaNs AFTER computing features
-    df = df.dropna().copy()
+    # Drop any rows with NaNs from rolling ops
+    df = df.dropna().reset_index(drop=True)
+
+    # Next-hour regression target and binary label
+    df["next_delta"] = df["close"].shift(-1) - df["close"]
+    df["actual_direction"] = (df["next_delta"] > 50).astype(int)
 
     return df
 
 
-# App UI
-st.title("BTC Price Movement Predictor")  # 📈
-st.markdown("Using XGBoost to predict the probability of BTC going up in the next hour")
+# ─── 6. Performance DataFrame ──────────────────────────────────────────────────
+@st.cache_data
+def load_performance_dataframe(limit: int = 500) -> pd.DataFrame:
+    """
+    Build a DataFrame of the last `limit` complete hours,
+    with true labels and model predictions.
+    """
+    raw = fetch_latest_hour(limit + 1)
+    features_df = compute_features(raw)
+    df_recent = features_df.iloc[-(limit + 1) : -1].copy()
 
-# === Live BTC Price ===
-st.subheader("Live BTC Price (Real-Time)")  # 💸
-live_data = fetch_current_btc_price()
+    # Model predictions
+    proba = model.predict_proba(df_recent[FEATURES])[:, 1]
+    df_recent["hist_probs"] = proba
+    df_recent["hist_preds"] = (proba > 0.5).astype(int)
 
-st.metric("Price (USD)", f"${live_data['price']:,.2f}")
-st.metric("24h Change", f"{live_data['change_24h']:,.2f}")
-st.metric("24h Volume", f"{live_data['volume_24h']:,.2f}")
-
-
-# === Section: Refresh button to update data ===
-# === Section: Refresh button ===
-if st.button("Refresh Data"):  # 🔄
-    # Refresh and store everything in session
-    st.session_state["btc_hourly_data"] = fetch_latest_hour()
-    st.session_state["btc_live_data"] = fetch_current_btc_price()
+    return df_recent
 
 
-# Fetch or fallback (initial page load)
-# On initial load if session isn't initialized
-if "btc_hourly_data" not in st.session_state:
-    st.session_state["btc_hourly_data"] = fetch_latest_hour()
-if "btc_live_data" not in st.session_state:
-    st.session_state["btc_live_data"] = fetch_current_btc_price()
+# ─── 7. Streamlit App Layout ────────────────────────────────────────────────────
+st.title("BTC Price Movement Predictor")
+st.markdown("Using XGBoost to predict whether BTC will rise in the next hour")
+
+# Create two main tabs
+predict_tab, monitor_tab = st.tabs(["⬆⬇ Predictor", "Model Monitoring"])
+
+# ─── 7a. Predictor Tab ─────────────────────────────────────────────────────────
+with predict_tab:
+    st.header("Live BTC Price & Next-Hour Signal")
+
+    # Display current price metrics
+    live_price = fetch_current_btc_price()
+    st.metric("Price (USD)", f"${live_price['price']:,.2f}")
+    st.metric("24h Δ (USD)", f"{live_price['change_24h']:,.2f}")
+    st.metric("24h Volume", f"{live_price['volume_24h']:,.2f}")
+
+    # Refresh button for OHLCV
+    if st.button("Refresh OHLCV"):
+        st.session_state["ohlcv_data"] = fetch_latest_hour()
+
+    # Load or fetch into session state
+    if "ohlcv_data" not in st.session_state:
+        st.session_state["ohlcv_data"] = fetch_latest_hour()
+    df_raw = st.session_state["ohlcv_data"]
+
+    # Prepare features
+    df_x = compute_features(df_raw)
+    df = df_x.iloc[:-1]
+    df_partial = df_raw.iloc[-1:]
+
+    # Show in‑progress candle
+    st.subheader("Current Hour (In-Progress)")
+    st.dataframe(df_partial[["timestamp", "close", "volume_btc", "high", "low"]])
+    st.caption("Predictions use only fully completed hourly candles.")
+
+    # If we have ≥11 hours, make the next‑hour prediction
+    if len(df) >= 11:
+        df_recent = df.iloc[-11:]
+        df_hist = df_recent.iloc[:-1]
+        df_current = df_recent.iloc[-1:]
+
+        # Next‑hour inference
+        X_current = df_current[FEATURES]
+        proba = model.predict_proba(X_current)[0, 1]
+        label = model.predict(X_current)[0]
+
+        st.subheader("Next-Hour Forecast")
+        st.metric("Direction", "↑ Up" if label == 1 else "↓ Down/Neutral")
+        st.metric("Confidence", f"{proba*100:.2f}%")
+
+        # Show last 10 predictions for reference
+        st.subheader("Recent 10-Hour Signals")
+        X_hist = df_hist[FEATURES]
+        probs_hist = model.predict_proba(X_hist)[:, 1]
+        preds_hist = model.predict(X_hist)
+        confidences = [probs_hist[i] * 100 for i in range(len(probs_hist))]
+
+        display_df = df_hist[["timestamp", "close", "actual_direction"]].copy()
+        display_df["hist_preds"] = preds_hist
+        display_df["predicted_confidence"] = confidences
+        display_df["Predicted Label"] = display_df["hist_preds"].map(
+            {1: "↑ Up", 0: "↓ Down"}
+        )
+        display_df["Actual Label"] = display_df["actual_direction"].map(
+            {1: "↑ Up", 0: "↓ Down"}
+        )
+
+        st.dataframe(
+            display_df[
+                [
+                    "timestamp",
+                    "close",
+                    "Actual Label",
+                    "Predicted Label",
+                    "predicted_confidence",
+                ]
+            ].reset_index(drop=True)
+        )
+    else:
+        st.warning("Not enough historical data (need at least 11 complete hours).")
 
 
-# Load from session
-df_raw = st.session_state["btc_hourly_data"]
-live_data = st.session_state["btc_live_data"]
-
-
-# Preprocess data
-df_x = prepare_features(df_raw)
-
-# Split data for prediction (complete) vs display (partial)
-df = df_x.iloc[:-1].copy()  # last complete hour
-df_partial = df_raw.iloc[-1:].copy()  # raw in-progress row (always shown)
-
-# Calculate target and actual direction
-df["target"] = df["close"].shift(-1) - df["close"]
-threshold = 50
-df["actual_direction"] = df["target"].apply(lambda x: 1 if x > threshold else 0)
-
-# ✅ Always show current hour (in-progress)
-st.subheader("Current Hour (Partial)")  # 🕒
-st.dataframe(df_partial[["timestamp", "close", "volume_btc", "high", "low"]])
-st.caption(
-    "This row shows the current hour-in-progress. Predictions are made only on complete hourly candles."
-)
-
-# Proceed only if we have enough rows
-if len(df) >= 11:
-    df_recent = df.iloc[-11:].copy()
-    df_hist = df_recent.iloc[:-1]
-    df_current = df_recent.iloc[-1:]
-
-    # Predict current hour
-    X_current = df_current[FEATURES]
-    proba = model.predict_proba(X_current)[0]
-    label = model.predict(X_current)[0]
-
-    st.subheader("Current Hour Prediction")  # 📍
-    st.metric("Prediction", "↑ Up" if label == 1 else "↓ Down/Neutral")
-    st.metric("Confidence", f"{proba[label]:.2f}%")
-    st.dataframe(
-        df_current[["timestamp", "close", "volume_btc", "momentum", "volatility_24h"]]
+# ─── 7b. Model Monitoring Tab ───────────────────────────────────────────────────
+with monitor_tab:
+    perf_df = load_performance_dataframe().set_index("timestamp")
+    perf_subtab, drift_subtab, pred_subtab = st.tabs(
+        ["Performance", "Data Drift", "Predictions"]
     )
 
-    # Predict past 10 hours
-    st.subheader("Last 10 Hourly Predictions")  # 📊
-    X_hist = df_hist[FEATURES]
-    hist_probs = model.predict_proba(X_hist)
-    hist_preds = model.predict(X_hist)
-    hist_confidence = [hist_probs[i][hist_preds[i]] for i in range(len(hist_preds))]
+    # — Performance —
+    with perf_subtab:
+        st.subheader("Performance Monitoring")
+        st.markdown("Track classification metrics once ground-truth arrives.")
 
-    hist_results = df_hist[["timestamp", "close", "actual_direction"]].copy()
-    hist_results["predicted_direction"] = hist_preds
-    hist_results["predicted_confidence"] = hist_confidence
-    hist_results["predicted_label"] = hist_results["predicted_direction"].map(
-        {1: "↑ Up", 0: "↓ Down/Neutral"}
-    )
-    hist_results["actual_label"] = hist_results["actual_direction"].map(
-        {1: "↑ Up", 0: "↓ Down/Neutral"}
-    )
+        # True vs. predicted directions
+        y_true = perf_df["actual_direction"]
+        y_pred = perf_df["hist_preds"]
 
-    st.dataframe(
-        hist_results[
-            [
-                "timestamp",
-                "close",
-                "actual_label",
-                "predicted_label",
-                "predicted_confidence",
-            ]
-        ].reset_index(drop=True)
-    )
-else:
-    st.warning("Not enough valid data rows to make predictions.")
+        # Compute metrics
+        metrics = {
+            "Accuracy": accuracy_score(y_true, y_pred),
+            "Precision": precision_score(y_true, y_pred, zero_division=0),
+            "Recall": recall_score(y_true, y_pred, zero_division=0),
+            "F1-Score": f1_score(y_true, y_pred),
+            "ROC-AUC": roc_auc_score(y_true, perf_df["hist_probs"]),
+        }
+        cols = st.columns(len(metrics))
+        for col, (name, val) in zip(cols, metrics.items()):
+            col.metric(name, f"{val:.2f}")
+
+        # Rolling percentage of ups
+        st.subheader("Rolling Percentage of Ups in the Last 24-hours")
+        roll_rates = (
+            perf_df[["hist_preds", "actual_direction"]].rolling("24h").mean().mul(100)
+        )
+        fig, ax = plt.subplots()
+        sns.lineplot(data=roll_rates, ax=ax, dashes=False)
+        ax.set_ylabel("% Up")
+        plt.xticks(rotation=45, ha="right")
+        st.pyplot(fig)
+
+        # Sample count
+        num_samples = len(y_true)
+        st.write(f"ℹ️ Evaluating on **{num_samples}** samples")
+
+        # Confusion matrix
+        st.subheader("Confusion Matrix")
+        cm = confusion_matrix(y_true, y_pred)
+        fig, ax = plt.subplots()
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt="d",
+            xticklabels=["Down", "Up"],
+            yticklabels=["Down", "Up"],
+            ax=ax,
+        )
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        st.pyplot(fig)
+
+    # — Data Drift Sub‑Tab —
+    with drift_subtab:
+        st.subheader("Data (Input) Monitoring")
+        st.markdown("Detect feature distribution drift with PSI & KS test.")
+
+        with st.expander("ℹ️ What are PSI & KS?"):
+            st.latex(
+                r"""
+                \mathrm{PSI}
+                = \sum_{i=1}^{k} \bigl(p_i - q_i\bigr)
+                \ln\!\biggl(\frac{p_i}{q_i}\biggr)
+                """
+            )
+            st.markdown(
+                """
+                **Population Stability Index (PSI)**
+                - \(p_i\): proportion in bin *i* of the **baseline** data
+                - \(q_i\): proportion in bin *i* of the **recent** data
+
+                **Interpretation:**
+                - **PSI < 0.10** → Negligible drift
+                - **0.10 ≤ PSI ≤ 0.25** → Moderate drift
+                - **PSI > 0.25** → Major drift
+                """
+            )
+
+            st.markdown("**Kolmogorov-Smirnov (KS) Test**")
+            st.latex(
+                r"""
+                D = \sup_x \bigl|F_{\mathrm{baseline}}(x) - F_{\mathrm{recent}}(x)\bigr|
+                """
+            )
+            st.markdown(
+                """
+                - **\(D\)**: max distance between the two empirical CDFs
+                - **p-value**: chance of seeing a \(D\) this large if distributions were the same
+
+                **Interpretation:**
+                - **p < 0.05** → reject “no drift” at the 5% level
+                - Larger \(D\) means greater distributional difference
+                """
+            )
+
+        # Split baseline vs. last 24 hrs
+        feature_hist = perf_df[FEATURES]
+        baseline_df = feature_hist.iloc[:-24]
+        recent_24h_df = feature_hist.iloc[-24:]
+
+        # Compute PSI & KS, build summary table
+        drift_summary = []
+        for feat in FEATURES:
+            psi_val = psi(baseline_df[feat].values, recent_24h_df[feat].values)
+            ks_stat, ks_p = ks_2samp(baseline_df[feat], recent_24h_df[feat])
+            if psi_val > 0.25:
+                status = "🔴 Major drift"
+            elif psi_val > 0.10 or ks_p < 0.05:
+                status = "🟡 Moderate drift"
+            else:
+                status = "🟢 OK"
+            drift_summary.append(
+                {
+                    "Feature": feat,
+                    "PSI": f"{psi_val:.3f}",
+                    "KS p‑value": f"{ks_p:.3f}",
+                    "Status": status,
+                }
+            )
+
+        st.table(pd.DataFrame(drift_summary).set_index("Feature"))
+
+        # Overlayed distributions
+        st.subheader("Feature Distributions: Baseline vs. Last 24 hours")
+        for feat in FEATURES:
+            fig, ax = plt.subplots()
+            sns.histplot(
+                baseline_df[feat],
+                stat="density",
+                element="step",
+                label="Baseline",
+                ax=ax,
+            )
+            sns.histplot(
+                recent_24h_df[feat],
+                stat="density",
+                element="step",
+                label="Last 24-hrs",
+                ax=ax,
+            )
+            ax.set_title(feat)
+            ax.legend()
+            st.pyplot(fig)
+
+    # — Prediction —
+    with pred_subtab:
+        st.subheader("Prediction Monitoring")
+        st.markdown("Ensure the model's output remains well-calibrated and stable.")
+
+        # Confidence score distribution
+        st.subheader("Confidence Score Histogram")
+        fig, ax = plt.subplots()
+        sns.histplot(
+            perf_df["hist_probs"],
+            bins=10,
+            stat="count",
+            ax=ax,
+        )
+        ax.set_xlabel("P(up)")
+        ax.set_ylabel("Count")
+        st.pyplot(fig)
