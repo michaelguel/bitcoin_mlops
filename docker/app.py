@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 # Load model
-model = joblib.load("./btc_xgb_classifier.pkl")
+model = joblib.load("docker/btc_xgb_classifier.pkl")
 
 # Define feature order (must match training)
 FEATURES = [
