@@ -95,6 +95,58 @@ def fetch_current_btc_price() -> dict:
     }
 
 
+@st.cache_data
+def load_baseline_training_data(
+    path: str = os.path.join(HERE, "btc_hourly_ohlc_volume_1year_cryptocompare.csv"),
+) -> pd.DataFrame:
+    """
+    Load and preprocess the training data to use as baseline for drift analysis.
+    Applies the same rolling features and log1p transforms as used in training.
+    """
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+
+    df["momentum"] = df["close"] - df["open"]
+    df["volatility_24h"] = df["close"].rolling(window=24).std()
+    df["sma_24"] = df["close"].rolling(window=24).mean()
+    df["sma_168"] = df["close"].rolling(window=168).mean()
+    df["return_1h"] = df["close"].pct_change(1)
+    df["return_3h"] = df["close"].pct_change(3)
+    df["return_6h"] = df["close"].pct_change(6)
+
+    df = df.dropna().reset_index(drop=True)
+
+    df["log_vol"] = np.log(df["volume_btc"].replace(0, np.nan)).fillna(method="bfill")
+    df["vol_pct_change"] = df["volume_btc"].pct_change()
+
+    df = df.copy()
+    # 1‑bar log‑return for O & C
+    df["log_ret_open"] = np.log(df["open"]).diff()
+    df["log_ret_close"] = np.log(df["close"]).diff()
+
+    # Range as % of close
+    df["hl_spread_pct"] = (df["high"] - df["low"]) / df["close"]
+    # Momentum (example: 24‑bar price diff) z‑scored over 30 bars
+    df["mom_24"] = df["close"] - df["close"].shift(24)
+    df["mom_24_z"] = (df["mom_24"] - df["mom_24"].rolling(30).mean()) / df[
+        "mom_24"
+    ].rolling(30).std()
+
+    # Volatility rescaled
+    df["vol24_rel"] = df["volatility_24h"] / df["volatility_24h"].rolling(30).median()
+
+    # Price‑vs‑moving‑averages ratios
+    df["ratio_sma_24"] = np.log(df["close"] / df["sma_24"])
+    df["ratio_sma_168"] = np.log(df["close"] / df["sma_168"])
+
+    for feat in FEATURES:
+        df[feat] = df[feat].clip(lower=0)  # avoid log1p of negative
+        df[feat] = np.log1p(df[feat])
+
+    df.dropna(inplace=True)
+
+    return df.tail(180 * 24)  # last 180 days (hourly)
+
+
 # ─── 5. Feature Engineering ─────────────────────────────────────────────────────
 def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -327,15 +379,70 @@ with monitor_tab:
             )
 
         # Split baseline vs. last 24 hrs
-        feature_hist = perf_df[FEATURES]
-        baseline_df = feature_hist.iloc[:-24]
-        recent_24h_df = feature_hist.iloc[-24:]
+        # Load training-based baseline (180-day) and current live data
+        baseline_df = load_baseline_training_data()
+        recent_24h_df = perf_df[FEATURES].iloc[-168:].copy()
+
+        # Apply log1p to match training transformation
+        log_baseline = baseline_df.copy()
+        log_recent = recent_24h_df.copy()
+
+        log_recent["log_vol"] = np.log(
+            log_recent["volume_btc"].replace(0, np.nan)
+        ).fillna(method="bfill")
+        log_recent["vol_pct_change"] = log_recent["volume_btc"].pct_change()
+
+        log_recent = log_recent.copy()
+        # 1‑bar log‑return for O & C
+        log_recent["log_ret_open"] = np.log(log_recent["open"]).diff()
+        log_recent["log_ret_close"] = np.log(log_recent["close"]).diff()
+
+        # Range as % of close
+        log_recent["hl_spread_pct"] = (
+            log_recent["high"] - log_recent["low"]
+        ) / log_recent["close"]
+        # Momentum (example: 24‑bar price diff) z‑scored over 30 bars
+        log_recent["mom_24"] = log_recent["close"] - log_recent["close"].shift(24)
+        log_recent["mom_24_z"] = (
+            log_recent["mom_24"] - log_recent["mom_24"].rolling(30).mean()
+        ) / log_recent["mom_24"].rolling(30).std()
+
+        # Volatility rescaled
+        log_recent["vol24_rel"] = (
+            log_recent["volatility_24h"]
+            / log_recent["volatility_24h"].rolling(30).median()
+        )
+
+        # Price‑vs‑moving‑averages ratios
+        log_recent["ratio_sma_24"] = np.log(log_recent["close"] / log_recent["sma_24"])
+        log_recent["ratio_sma_168"] = np.log(
+            log_recent["close"] / log_recent["sma_168"]
+        )
+
+        for feat in FEATURES:
+            log_recent[feat] = log_recent[feat].clip(lower=0)
+            log_recent[feat] = np.log1p(log_recent[feat])
+        log_recent.dropna(inplace=True)
 
         # Compute PSI & KS, build summary table
         drift_summary = []
+        FEATURES = FEATURES + [
+            "vol_pct_change",
+            "vol24_rel",
+            "ratio_sma_168",
+            "ratio_sma_24",
+            "vol24_rel",
+            "mom_24_z",
+            "mom_24",
+            "hl_spread_pct",
+            "log_ret_close",
+            "log_ret_open",
+        ]
         for feat in FEATURES:
-            psi_val = psi(baseline_df[feat].values, recent_24h_df[feat].values)
-            ks_stat, ks_p = ks_2samp(baseline_df[feat], recent_24h_df[feat])
+            psi_val = psi(
+                log_baseline[feat][60:].values, log_recent[feat][60:500].values
+            )
+            ks_stat, ks_p = ks_2samp(log_baseline[feat][60:], log_recent[feat][60:500])
             if psi_val > 0.25:
                 status = "🔴 Major drift"
             elif psi_val > 0.10 or ks_p < 0.05:
@@ -346,7 +453,7 @@ with monitor_tab:
                 {
                     "Feature": feat,
                     "PSI": f"{psi_val:.3f}",
-                    "KS p‑value": f"{ks_p:.3f}",
+                    "KS p-value": f"{ks_p:.3f}",
                     "Status": status,
                 }
             )
@@ -358,14 +465,14 @@ with monitor_tab:
         for feat in FEATURES:
             fig, ax = plt.subplots()
             sns.histplot(
-                baseline_df[feat],
+                log_baseline[feat],
                 stat="density",
                 element="step",
                 label="Baseline",
                 ax=ax,
             )
             sns.histplot(
-                recent_24h_df[feat],
+                log_recent[feat],
                 stat="density",
                 element="step",
                 label="Last 24-hrs",
