@@ -23,7 +23,9 @@ ROOT = os.path.abspath(os.path.join(HERE, os.pardir))
 MODEL_PATH = os.path.join(ROOT, "model", "btc_xgb_classifier.json")
 
 # Load pre-trained XGBoost classifier
-model = XGBClassifier()
+model = XGBClassifier(
+    objective="binary:logistic", eval_metric="logloss", n_estimators=100
+)
 model.load_model(MODEL_PATH)
 
 
@@ -113,12 +115,11 @@ def load_baseline_training_data(
     df["return_3h"] = df["close"].pct_change(3)
     df["return_6h"] = df["close"].pct_change(6)
 
-    df = df.dropna().reset_index(drop=True)
+    # df = df.dropna().reset_index(drop=True)
 
     df["log_vol"] = np.log(df["volume_btc"].replace(0, np.nan)).fillna(method="bfill")
     df["vol_pct_change"] = df["volume_btc"].pct_change()
 
-    df = df.copy()
     # 1‑bar log‑return for O & C
     df["log_ret_open"] = np.log(df["open"]).diff()
     df["log_ret_close"] = np.log(df["close"]).diff()
@@ -392,7 +393,6 @@ with monitor_tab:
         ).fillna(method="bfill")
         log_recent["vol_pct_change"] = log_recent["volume_btc"].pct_change()
 
-        log_recent = log_recent.copy()
         # 1‑bar log‑return for O & C
         log_recent["log_ret_open"] = np.log(log_recent["open"]).diff()
         log_recent["log_ret_close"] = np.log(log_recent["close"]).diff()
@@ -401,6 +401,7 @@ with monitor_tab:
         log_recent["hl_spread_pct"] = (
             log_recent["high"] - log_recent["low"]
         ) / log_recent["close"]
+
         # Momentum (example: 24‑bar price diff) z‑scored over 30 bars
         log_recent["mom_24"] = log_recent["close"] - log_recent["close"].shift(24)
         log_recent["mom_24_z"] = (
@@ -426,23 +427,27 @@ with monitor_tab:
 
         # Compute PSI & KS, build summary table
         drift_summary = []
-        FEATURES = FEATURES + [
+        DRIFT_FEATURES = [
+            "momentum",
+            "return_1h",
+            "return_3h",
             "vol_pct_change",
-            "vol24_rel",
-            "ratio_sma_168",
-            "ratio_sma_24",
-            "vol24_rel",
-            "mom_24_z",
-            "mom_24",
-            "hl_spread_pct",
             "log_ret_close",
             "log_ret_open",
         ]
-        for feat in FEATURES:
-            psi_val = psi(
-                log_baseline[feat][60:].values, log_recent[feat][60:500].values
-            )
-            ks_stat, ks_p = ks_2samp(log_baseline[feat][60:], log_recent[feat][60:500])
+        #     "vol_pct_change",
+        #     "vol24_rel",
+        #     "ratio_sma_168",
+        #     "ratio_sma_24",
+        #     "mom_24_z",
+        #     "mom_24",
+        #     "hl_spread_pct",
+        #     "log_ret_close",
+        #     "log_ret_open",
+        # ]
+        for feat in DRIFT_FEATURES:
+            psi_val = psi(log_baseline[feat][60:].values, log_recent[feat][60:].values)
+            ks_stat, ks_p = ks_2samp(log_baseline[feat][60:], log_recent[feat][60:])
             if psi_val > 0.25:
                 status = "🔴 Major drift"
             elif psi_val > 0.10 or ks_p < 0.05:
@@ -461,8 +466,8 @@ with monitor_tab:
         st.table(pd.DataFrame(drift_summary).set_index("Feature"))
 
         # Overlayed distributions
-        st.subheader("Feature Distributions: Baseline vs. Last 24 hours")
-        for feat in FEATURES:
+        st.subheader("Feature Distributions: Recent Window (180 days) vs. Last 7 days")
+        for feat in DRIFT_FEATURES:
             fig, ax = plt.subplots()
             sns.histplot(
                 log_baseline[feat],
@@ -475,7 +480,7 @@ with monitor_tab:
                 log_recent[feat],
                 stat="density",
                 element="step",
-                label="Last 24-hrs",
+                label="Last 7 days",
                 ax=ax,
             )
             ax.set_title(feat)
