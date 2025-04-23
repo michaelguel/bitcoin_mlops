@@ -1,4 +1,5 @@
 import os
+
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -111,7 +112,7 @@ def load_baseline_training_data(
     df = df.dropna().reset_index(drop=True)
 
     df["log_vol"] = np.log(df["volume_btc"].replace(0, np.nan)).fillna(method="bfill")
-    df["vol_pct_change"] = df["volume_btc"].pct_change()
+    df["Volume Change % (BTC)"] = df["volume_btc"].pct_change()
 
     df = df.copy()
     # 1‑bar log‑return for O & C
@@ -122,12 +123,12 @@ def load_baseline_training_data(
     df["hl_spread_pct"] = (df["high"] - df["low"]) / df["close"]
     # Momentum (example: 24‑bar price diff) z‑scored over 30 bars
     df["mom_24"] = df["close"] - df["close"].shift(24)
-    df["mom_24_z"] = (df["mom_24"] - df["mom_24"].rolling(30).mean()) / df[
+    df["mom_24_z"] = (df["mom_24"] - df["mom_24"].rolling(24).mean()) / df[
         "mom_24"
-    ].rolling(30).std()
+    ].rolling(24).std()
 
     # Volatility rescaled
-    df["vol24_rel"] = df["volatility_24h"] / df["volatility_24h"].rolling(30).median()
+    df["vol24_rel"] = df["volatility_24h"] / df["volatility_24h"].rolling(24).median()
 
     # Price‑vs‑moving‑averages ratios
     df["ratio_sma_24"] = np.log(df["close"] / df["sma_24"])
@@ -385,7 +386,7 @@ with monitor_tab:
         log_recent["log_vol"] = np.log(
             log_recent["volume_btc"].replace(0, np.nan)
         ).fillna(method="bfill")
-        log_recent["vol_pct_change"] = log_recent["volume_btc"].pct_change()
+        log_recent["Volume Change % (BTC)"] = log_recent["volume_btc"].pct_change()
 
         log_recent = log_recent.copy()
         # 1‑bar log‑return for O & C
@@ -400,12 +401,12 @@ with monitor_tab:
         log_recent["mom_24"] = log_recent["close"] - log_recent["close"].shift(24)
         log_recent["mom_24_z"] = (
             log_recent["mom_24"] - log_recent["mom_24"].rolling(30).mean()
-        ) / log_recent["mom_24"].rolling(30).std()
+        ) / log_recent["mom_24"].rolling(24).std()
 
         # Volatility rescaled
         log_recent["vol24_rel"] = (
             log_recent["volatility_24h"]
-            / log_recent["volatility_24h"].rolling(30).median()
+            / log_recent["volatility_24h"].rolling(24).median()
         )
 
         # Price‑vs‑moving‑averages ratios
@@ -421,23 +422,17 @@ with monitor_tab:
 
         # Compute PSI & KS, build summary table
         drift_summary = []
-        FEATURES = FEATURES + [
-            "vol_pct_change",
-            "vol24_rel",
-            "ratio_sma_168",
-            "ratio_sma_24",
-            "vol24_rel",
-            "mom_24_z",
-            "mom_24",
-            "hl_spread_pct",
+        FEATURES = [
+            "momentum",
+            "return_1h",
+            "return_3h",
+            "Volume Change % (BTC)",
             "log_ret_close",
             "log_ret_open",
         ]
         for feat in FEATURES:
-            psi_val = psi(
-                log_baseline[feat][60:].values, log_recent[feat][60:500].values
-            )
-            ks_stat, ks_p = ks_2samp(log_baseline[feat][60:], log_recent[feat][60:500])
+            psi_val = psi(log_baseline[feat][60:].values, log_recent[feat][60:].values)
+            ks_stat, ks_p = ks_2samp(log_baseline[feat][60:], log_recent[feat][60:])
             if psi_val > 0.25:
                 status = "🔴 Major drift"
             elif psi_val > 0.10 or ks_p < 0.05:
@@ -479,8 +474,7 @@ with monitor_tab:
 
     # — Prediction —
     with pred_subtab:
-        st.subheader("Prediction Monitoring")
-        st.markdown("Ensure the model's output remains well-calibrated and stable.")
+        st.subheader("Prediction Confidence Distribution")
 
         # Confidence score distribution
         st.subheader("Confidence Score Histogram")

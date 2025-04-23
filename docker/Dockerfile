@@ -15,4 +15,4 @@ RUN pip install -r requirements.txt
 EXPOSE 8501
 
 # Run Streamlit app
-CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--browser.serverAddress=localhost"]
+CMD ["streamlit", "run", "redo_app.py", "--server.address=0.0.0.0", "--browser.serverAddress=localhost"]
