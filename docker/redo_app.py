@@ -20,7 +20,7 @@ from xgboost import XGBClassifier
 
 # Load pre-trained XGBoost classifier
 model = XGBClassifier()
-model = joblib.load("btc_xgb_classifier.pkl")
+model = joblib.load("../docker/btc_xgb_classifier.pkl")
 
 
 # ─── 2. Feature Definitions ─────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ def fetch_current_btc_price() -> dict:
 
 @st.cache_data
 def load_baseline_training_data(
-    path: str = "btc_hourly_ohlc_volume_1year_cryptocompare.csv",
+    path: str = "../docker/btc_hourly_ohlc_volume_1year_cryptocompare.csv",
 ) -> pd.DataFrame:
     """
     Load and preprocess the training data to use as baseline for drift analysis.
