@@ -117,7 +117,7 @@ bitcoin_mlops/
 
 ## 9. Getting Started
 
-### 🧪 Run Locally
+### Run Locally
 
 ```bash
 cd app/
