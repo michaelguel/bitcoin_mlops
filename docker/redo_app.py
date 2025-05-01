@@ -18,11 +18,15 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
+HERE = os.path.dirname(__file__)
+ROOT = os.path.abspath(os.path.join(HERE, os.pardir))
+MODEL_PATH = os.path.join(ROOT, "model", "btc_xgb_classifier.pkl")
+
 # Load pre-trained XGBoost classifier
 model = XGBClassifier()
-model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "btc_xgb_classifier.pkl"))
-model = joblib.load(model_path)
-# model = joblib.load("../docker/btc_xgb_classifier.pkl")
+# model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "btc_xgb_classifier.pkl"))
+# model = joblib.load(model_path)
+model = joblib.load(MODEL_PATH)
 
 
 # ─── 2. Feature Definitions ─────────────────────────────────────────────────────
@@ -95,7 +99,7 @@ def fetch_current_btc_price() -> dict:
 
 @st.cache_data
 def load_baseline_training_data(
-    path: str = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "btc_hourly_ohlc_volume_1year_cryptocompare.csv"))
+    path: str = os.path.join(HERE, "btc_hourly_ohlc_volume_1year_cryptocompare.csv"),
 ) -> pd.DataFrame:
     """
     Load and preprocess the training data to use as baseline for drift analysis.
