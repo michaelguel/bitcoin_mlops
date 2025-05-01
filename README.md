@@ -61,3 +61,68 @@ Dockerized for platform-independent deployment
 ```bash
 docker build -t btc-app .
 docker run -p 8501:8501 btc-app
+```
+
+**View app:**
+- http://localhost:8501/
+  
+---
+
+## 6. Monitoring Dashboard (Embedded in App)
+
+The monitoring dashboard is integrated directly into the Streamlit app and provides real-time insights into model behavior.
+
+**Tracks:**
+- Recent prediction distribution (↑ vs ↓)
+- Average prediction confidence
+- Real-time prediction logs
+- In-progress data vs model inputs
+
+---
+
+## 7. Risks in Production
+
+**Model Drift**  
+Market behavior may change over time (e.g., shifting volatility regimes), causing the model's performance to degrade.
+
+**Data Availability**  
+The CryptoCompare API may impose rate limits or change its structure, impacting data ingestion.
+
+**Confidence Misuse**  
+Predictions with low confidence might be incorrectly trusted by users, potentially leading to poor decision-making.
+
+**Lag in Real-Time Data**  
+Partially formed hourly candles could distort the model’s input, leading to misleading predictions if not handled properly.
+
+---
+
+## 8. Repository Structure
+
+bitcoin_mlops/
+├── data/
+│   └── btc_hourly_ohlc_.csv
+│   └── data_injestion.py
+├── model/
+│   └── btc_xgb_classifier.pkl
+│   └── model_features_train.ipynb
+├── docker/
+│   └── app.py
+│   └── requirements.txt
+│   └── Dockerfile
+│   └── .streamlit/
+│       └── config.toml
+
+
+---
+
+## 9. Getting Started
+
+### 🧪 Run Locally
+
+```bash
+cd app/
+docker build -t btc-app .
+docker run -p 8501:8501 btc-app
+```
+
+
