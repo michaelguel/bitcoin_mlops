@@ -98,19 +98,7 @@ Partially formed hourly candles could distort the model’s input, leading to mi
 
 ## 8. Repository Structure
 
-bitcoin_mlops/
-├── data/
-│   └── btc_hourly_ohlc_.csv
-│   └── data_injestion.py
-├── model/
-│   └── btc_xgb_classifier.pkl
-│   └── model_features_train.ipynb
-├── docker/
-│   └── app.py
-│   └── requirements.txt
-│   └── Dockerfile
-│   └── .streamlit/
-│       └── config.toml
+<pre><code>```text bitcoin_mlops/ ├── data/ │ └── btc_hourly_ohlc_.csv ├── data_injestion.py ├── model/ │ └── btc_xgb_classifier.pkl │ └── model_features_train.ipynb ├── docker/ │ └── app.py │ └── requirements.txt │ └── Dockerfile ├── .streamlit/ │ └── config.toml ``` </code></pre>
 
 
 ---
